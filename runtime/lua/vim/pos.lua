@@ -8,6 +8,7 @@
 --- objects.
 
 local api = vim.api
+local fn = vim.fn
 local validate = vim.validate
 
 --- Represents a well-defined position.
@@ -42,12 +43,18 @@ local validate = vim.validate
 --- When specified, it indicates that this position belongs to a specific buffer.
 --- This field is required when performing position conversions.
 ---@field buf? integer
+--- Optional winid handle.
+---
+--- When specified, it indicates that this position belongs to the buffer in a specific window.
+--- This field is required for the `to_screenpos` conversion.
+---@field win? integer
 local Pos = {}
 Pos.__index = Pos
 
 ---@class vim.Pos.Optional
 ---@inlinedoc
 ---@field buf? integer
+---@field win? integer
 
 ---@package
 ---@param row integer
@@ -65,7 +72,12 @@ function Pos.new(row, col, opts)
     row = row,
     col = col,
     buf = opts.buf,
+    win = opts.win,
   }, Pos)
+
+  if self.win ~= nil and self.buf == nil then
+    self.buf = api.nvim_win_get_buf(self.win)
+  end
 
   return self
 end
@@ -185,8 +197,9 @@ end
 
 --- Creates a new |vim.Pos| from cursor position.
 ---@param pos [integer, integer]
-function Pos.cursor(pos)
-  return Pos.new(pos[1] - 1, pos[2])
+---@param winid? integer
+function Pos.cursor(pos, winid)
+  return Pos.new(pos[1] - 1, pos[2], { win = winid })
 end
 
 --- Converts |vim.Pos| to extmark position.
@@ -201,6 +214,100 @@ end
 function Pos.extmark(pos)
   local row, col = unpack(pos)
   return Pos.new(row, col)
+end
+
+--- Return the height of tabline + winbar
+---@param winid integer
+---@return integer
+local function get_wintab_height(winid)
+  local result = 0
+  for attr, line_expr in pairs({
+    tabline = tostring(vim.o.tabline),
+    winbar = vim.wo[winid].winbar,
+  }) do
+    local line_info = vim.api.nvim_eval_statusline(line_expr, {
+      winid = winid,
+      ['use_' .. attr] = true,
+    })
+
+    if line_info.str ~= '' then
+      result = result + #vim.split(line_info.str, '\n', { trimempty = false })
+    end
+  end
+  return result
+end
+
+---@param winid integer
+---@param lnum? integer
+local function get_statuscolumn_width(winid, lnum)
+  ---@type string
+  local expr = vim.opt.statuscolumn:get()
+  local col_val = api.nvim_eval_statusline(expr, { winid = winid, use_statuscol_lnum = lnum })
+  return col_val.width
+end
+
+---@param pos vim.Pos
+---@param winid? integer
+--- Recieves a position in a buffer displayed in a window (`winid`).
+--- Returns the zero-based index of the position in the display grid, excluding the tabline, winbar
+--- and status/number column.
+---
+--- Returns `{-1, -1}` if the `pos` is not visible in the window.
+--- Throws an assertion error when there's no `winid` associated with `pos` and a valid `winid` is
+--- not provided.
+---@return [integer, integer]
+function Pos.to_display(pos, winid)
+  winid = winid or pos.win
+  assert(winid ~= nil and api.nvim_win_is_valid(winid), 'vim.pos.to_display() need a valid winid.')
+  ---@cast winid -nil
+
+  local cursor_pos = pos:to_cursor()
+  local winbar_size = fn.getwininfo(winid)[1].winbar
+  local win_config = api.nvim_win_get_config(winid)
+
+  ---@type [integer, integer]
+  local winpos = fn.win_screenpos(winid)
+  local charpos = fn.screenpos(winid, pos.row + 1, pos.col + 1)
+
+  local border_offset = { row = 1, col = 1 }
+  local border = (win_config.border or vim.o.winborder)
+
+  if border == 'none' or border == '' then
+    border_offset.row = 0
+    border_offset.col = 0
+  else
+    local border_chars = border
+    if type(border_chars) == 'string' and border_chars:find(',') then
+      border_chars = vim.split(border_chars, ',', { trimempty = false })
+    end
+    if type(border_chars) == 'table' and vim.islist(border_chars) and #border_chars == 8 then
+      -- handle the case where the borders are not of the same size.
+      border_offset.row = border_chars[2]:len()
+      border_offset.col = border_chars[8]:len()
+    end
+  end
+
+  -- TODO: adjust for virt texts
+  return {
+    (charpos.row - winpos[1]) - winbar_size - border_offset.row,
+    (charpos.col - winpos[2]) - get_statuscolumn_width(winid, pos.row + 1) - border_offset.col,
+  }
+
+  -- ---@type integer
+  -- local screen_row = char_pos.row - get_wintab_height(winid) - 1
+  -- local screen_col = fn.virtcol({
+  --   cursor_pos[1],
+  --   (cursor_pos[2] + 1),
+  -- }, true, winid)[1] - 1
+  --
+  -- if screen_row < 0 or screen_col < 0 then
+  --   return { -1, -1 }
+  -- end
+  --
+  -- return {
+  --   screen_row,
+  --   screen_col % (api.nvim_win_get_width(winid) - get_statuscolumn_width(winid, cursor_pos[1])),
+  -- }
 end
 
 -- Overload `Range.new` to allow calling this module as a function.
